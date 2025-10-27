@@ -63,7 +63,7 @@ measurements = np.vstack((z_gyro, z_acc))
 m = measurements.shape[1]
 
 
-use_gps_v = True
+use_gps_v = False
 gps_every = 5                   # 50Hz에서 5스텝마다 10Hz
 v_meas_std = 0.8                # m/s (대략적인 표준편차)
 H_v = np.array([[1.0, 0.0, 0.0, 0.0, 0.0]])  # v 를 직접 관측
@@ -83,14 +83,6 @@ for k in range(m):
     K = P @ H.T @ np.linalg.inv(S)
     x = x + K @ y
     P = (I - K @ H) @ P
-
-    if use_gps_v and (k % gps_every == 0):
-        z_v = np.array([[speed[k]/3.6]])  # m/s
-        yv  = z_v - (H_v @ x)
-        Sv  = H_v @ P @ H_v.T + R_v
-        Kv  = P @ H_v.T @ np.linalg.inv(Sv)
-        x   = x + Kv @ yv
-        P   = (I - Kv @ H_v) @ P
 
     # log
     V_est.append(float(x[0]))
@@ -117,6 +109,6 @@ plt.step(range(m), ax_corr, label='a (IMU corrected)', alpha=0.6)
 plt.ylabel('Accel [m/s^2]'); plt.legend(loc='best')
 
 plt.subplot(414)
-plt.plot(BG_est, label='b_g'); plt.plot(BA_est, label='b_a')
-plt.ylabel('Bias'); plt.legend(loc='best'); plt.xlabel('Step')
+# plt.plot(BG_est, label='b_g'); plt.plot(BA_est, label='b_a')
+# plt.ylabel('Bias'); plt.legend(loc='best'); plt.xlabel('Step')
 plt.show()
