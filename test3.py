@@ -1,121 +1,152 @@
-#!/usr/bin/env python
-# coding: utf-8
-
+# 필터 사용 안 했을 경우 속도 추정?
 import numpy as np
 from matplotlib import pyplot as plt
+from scipy.integrate import cumtrapz
 
-dt = 1.0/50.0
-dtGPS=1.0/10.0 # Sample Rate of GPS is 10Hz
-
-# ---------- 프로세스/측정 표준편차 ----------
-# (Std 로 두고 제곱해서 분산으로 사용)
-px_proc_std = 0.5      # m        (위치 전이 노이즈)
-py_proc_std = 0.5      # m
-vx_proc_std = 1.0      # m/s      (속도 랜덤워크)
-vy_proc_std = 1.0      # m/s
-r_proc_std  = 0.02     # rad/s    (yaw rate 랜덤워크)
-bg_proc_std = 1e-3     # rad/s    (자이로 바이어스 랜덤워크)
-
-x_meas_std  = 3.0      # m        (위치 측정 표준편차; VIVE면 더 작게)
-y_meas_std  = 3.0      # m
-gyro_std    = 0.1      # rad/s    (자이로 측정 표준편차)
-
-Q = np.diag([px_proc_std**2, py_proc_std**2,
-             vx_proc_std**2, vy_proc_std**2,
-             r_proc_std**2,  bg_proc_std**2])
-
-R = np.diag([x_meas_std**2, y_meas_std**2, gyro_std**2])
-
-# ---------- 데이터 로드 ----------
+# Data Load
 datafile = '2014-03-26-000-Data.csv'
-(date, time, millis, ax, ay, az, rollrate, pitchrate, yawrate,
- roll, pitch, yaw, speed, course, latitude, longitude, altitude,
- pdop, hdop, vdop, epe, fix, satellites_view, satellites_used, temp
-) = np.loadtxt(datafile, delimiter=',', unpack=True, skiprows=1)
 
-# ---------- 위/경도 -> 평면(m) ----------
-RadiusEarth = 6378388.0
-arc = 2.0*np.pi*(RadiusEarth+altitude)/360.0
-dx = arc * np.cos(latitude*np.pi/180.0) * np.hstack((0.0, np.diff(longitude)))
-dy = arc * np.hstack((0.0, np.diff(latitude)))
-mx = np.cumsum(dx)
-my = np.cumsum(dy)
+date, \
+time, \
+millis, \
+ax, \
+ay, \
+az, \
+rollrate, \
+pitchrate, \
+yawrate, \
+roll, \
+pitch, \
+yaw, \
+speed, \
+course, \
+latitude, \
+longitude, \
+altitude, \
+pdop, \
+hdop, \
+vdop, \
+epe, \
+fix, \
+satellites_view, \
+satellites_used, \
+temp = np.loadtxt(datafile, delimiter=',', unpack=True, 
+                  #converters={1: mdates.strpdate2num('%H%M%S%f'),
+                  #            0: mdates.strpdate2num('%y%m%d')},
+                  skiprows=1)
 
-# ---------- 상태/측정 차원 ----------
-nx, nz = 6, 3   # [x,y,vx,vy,r,bg] / [x_meas, y_meas, gyro]
-I = np.eye(nx)
+print('Read \'%s\' successfully.' % datafile)
 
-# ---------- 초기 상태 ----------
-# 속도 초기치는 위치 미분으로 대략 잡아도 됨(여기선 0으로 시작)
-x = np.array([[mx[0]],
-              [my[0]],
-              [0.0],
-              [0.0],
-              [np.deg2rad(yawrate[0])],
-              [0.0]])
+# ------------ 유틸 ------------
+def Rzyx(roll, pitch, yaw):
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw),  np.sin(yaw)
+    Rz = np.array([[cy,-sy,0],[sy,cy,0],[0,0,1]])
+    Ry = np.array([[cp,0,sp],[0,1,0],[-sp,0,cp]])
+    Rx = np.array([[1,0,0],[0,cr,-sr],[0,sr,cr]])
+    return Rz @ Ry @ Rx
 
-P = np.diag([10.0, 10.0, 25.0, 25.0, 1.0, 1.0])
+def moving_average(x, N=5):
+    if N <= 1: return x
+    k = np.ones(N)/N
+    y = np.convolve(x, k, mode='same')
+    # 가장자리 왜곡 완화(선택)
+    y[:N//2] = x[:N//2]
+    y[-N//2:] = x[-N//2:]
+    return y
 
-# ---------- 상태전이/측정 행렬 ----------
-F = np.array([[1.0, 0.0, dt,  0.0, 0.0, 0.0],  # x_{k+1} = x_k + vx_k dt
-              [0.0, 1.0, 0.0, dt,  0.0, 0.0],  # y_{k+1} = y_k + vy_k dt
-              [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],  # vx 랜덤워크
-              [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],  # vy 랜덤워크
-              [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],  # r  랜덤워크
-              [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]]) # bg 랜덤워크
+# ------------ 데이터 로드 (네 코드와 동일 가정) ------------
+# date, time, millis, ax, ay, az, rollrate, pitchrate, yawrate, roll, pitch, yaw, speed, course, latitude, longitude, altitude, pdop, hdop, vdop, epe, fix, satellites_view, satellites_used, temp
+# = np.loadtxt(...)
 
-# 측정: z = [x_meas, y_meas, gyro] = [x, y, r + bg]
-H = np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-              [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-              [0.0, 0.0, 0.0, 0.0, 1.0, 1.0]])
+# ------------ 시간/각도 준비 ------------
+g = 9.80665
+t = (millis - millis[0]) / 1000.0
+if np.any(np.diff(t) <= 0):
+    dt = 1.0/50.0
+    t = np.arange(len(yaw)) * dt
+else:
+    # 샘플 간격 평균치
+    dt = np.mean(np.diff(t))
 
-# ---------- 계측 벡터 ----------
-z_pos = np.vstack((mx, my))
-z_gyro = np.deg2rad(yawrate)
-measurements = np.vstack((z_pos, z_gyro))  # shape (3, N)
-m = measurements.shape[1]
+yaw_unw = np.unwrap(np.deg2rad(yaw))
+roll_r  = np.deg2rad(roll)
+pitch_r = np.deg2rad(pitch)
 
-# ---------- 로그 ----------
-X_est, Y_est, VX_est, VY_est, R_est, BG_est = [], [], [], [], [], []
+# ------------ body->nav 회전 + 중력 보정 ------------
+N = len(t)
+ax_nav = np.zeros(N); ay_nav = np.zeros(N); az_nav = np.zeros(N)
 
-for k in range(m):
-    # --- Prediction
-    x = F @ x
-    P = F @ P @ F.T + Q
+for k in range(N):
+    Rbn = Rzyx(roll_r[k], pitch_r[k], yaw_unw[k])
+    acc_body = np.array([[ax[k]],[ay[k]],[az[k]]])  # m/s^2
+    acc_nav  = Rbn @ acc_body - np.array([[0.0],[0.0],[g]])
+    ax_nav[k], ay_nav[k], az_nav[k] = acc_nav[:,0]
 
-    # --- Measurement update (x, y, gyro)
-    z = measurements[:, k].reshape(nz, 1)
-    yv = z - (H @ x)
-    S  = H @ P @ H.T + R
-    K  = P @ H.T @ np.linalg.inv(S)
-    x  = x + K @ yv
-    P  = (I - K @ H) @ P
+# (선택) 저역통과(이동평균)로 고주파 노이즈 완화
+ax_nav_f = moving_average(ax_nav, N=5)
+ay_nav_f = moving_average(ay_nav, N=5)
 
-    # log
-    X_est.append(float(x[0])); Y_est.append(float(x[1]))
-    VX_est.append(float(x[2])); VY_est.append(float(x[3]))
-    R_est.append(float(x[4]));  BG_est.append(float(x[5]))
+# ------------ 정지(near-static) 구간에서 바이어스 추정/제거 ------------
+v_gps = speed / 3.6
+yawrate_meas = np.deg2rad(yawrate)
 
-# ---------- 속도 크기(스칼라) ----------
-V_est = np.sqrt(np.array(VX_est)**2 + np.array(VY_est)**2)
+static_mask = (v_gps < 0.3) & (np.abs(yawrate_meas) < np.deg2rad(0.5)) \
+              & (np.hypot(ax_nav_f, ay_nav_f) < 0.2)
 
-# ---------- Plot ----------
-fig = plt.figure(figsize=(16,14))
+if np.any(static_mask):
+    bx = np.median(ax_nav_f[static_mask])
+    by = np.median(ay_nav_f[static_mask])
+else:
+    bx = by = 0.0  # 정지 구간 없으면 0으로
+ax_nav_c = ax_nav_f - bx
+ay_nav_c = ay_nav_f - by
 
-plt.subplot(411)
-plt.plot(X_est, Y_est, label='KF position'); plt.scatter(mx[::5], my[::5], s=8, alpha=0.4, label='meas (pos)')
-plt.axis('equal'); plt.legend(); plt.title('Position (XY)')
+# ------------ 적분으로 속도 추정 (벡터 → 스칼라) ------------
+# 초기 속도 벡터는 GPS 속도+yaw로 설정
+v0  = v_gps[0]
+psi = yaw_unw
+vx0 = v0 * np.cos(psi[0])
+vy0 = v0 * np.sin(psi[0])
 
-plt.subplot(412)
-plt.step(range(m), V_est, label='|v| (KF)')
-plt.ylabel('Speed [m/s]'); plt.legend(loc='best')
+# 누적 적분: v(t) = v0 + ∫ a dt (trapezoidal)
+vx_est = vx0 + cumtrapz(ax_nav_c, t, initial=0.0)
+vy_est = vy0 + cumtrapz(ay_nav_c, t, initial=0.0)
 
-plt.subplot(413)
-plt.step(range(m), R_est, label='r (KF)')
-plt.step(range(m), np.deg2rad(yawrate), label='gyro', alpha=0.6)
-plt.ylabel('Yaw Rate [rad/s]'); plt.legend(loc='best')
+v_est  = np.hypot(vx_est, vy_est)   # 추정 스칼라 속도
+v_gpss = v_gps                      # 측정 스칼라 속도
 
-plt.subplot(414)
-plt.plot(BG_est, label='b_g (estimated)')
-plt.ylabel('Gyro bias [rad/s]'); plt.legend(loc='best'); plt.xlabel('Step')
+# ------------ 성능 지표(간단) ------------
+rmse = np.sqrt(np.mean((v_est - v_gpss)**2))
+bias = np.mean(v_est - v_gpss)
+
+print(f"Speed RMSE (est vs GPS): {rmse:.3f} m/s,  Bias: {bias:.3f} m/s")
+print(f"Estimated accel bias removed: bx={bx:.3f}, by={by:.3f} m/s^2")
+
+# ------------ 플롯 ------------
+fig, axs = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+# (1) 가속도 원시 vs 보정
+axs[0].plot(t, ax_nav,  label='ax_nav (raw)',  alpha=0.6)
+axs[0].plot(t, ay_nav,  label='ay_nav (raw)',  alpha=0.6)
+axs[0].plot(t, ax_nav_c, label='ax_nav (comp+debias)', linewidth=2)
+axs[0].plot(t, ay_nav_c, label='ay_nav (comp+debias)', linewidth=2)
+axs[0].set_ylabel('a_nav [m/s²]')
+axs[0].legend(loc='best'); axs[0].grid(True)
+
+# (2) 속도 비교 (스칼라)
+axs[1].plot(t, v_gpss, label='Speed (GPS)', alpha=0.8)
+axs[1].plot(t, v_est,  label='Speed (Integrated IMU)', linewidth=2)
+axs[1].set_ylabel('Speed [m/s]')
+axs[1].legend(loc='best'); axs[1].grid(True)
+
+# (3) 속도 벡터 성분 비교(참고)
+axs[2].plot(t, vx_est, label='vx_est')
+axs[2].plot(t, vy_est, label='vy_est')
+axs[2].set_xlabel('Time [s]')
+axs[2].set_ylabel('v-components [m/s]')
+axs[2].legend(loc='best'); axs[2].grid(True)
+
+plt.tight_layout()
 plt.show()
